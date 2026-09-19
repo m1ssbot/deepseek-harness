@@ -147,39 +147,49 @@ function Get-OfficialDefaultBranchInfo {
   }
 }
 
-function Sync-ForkMasterFromOfficial {
-  # Official -> fork master only. Does not switch the launch/work branch.
-  param([hashtable]$OfficialInfo)
-
-  $defaultBranch = $OfficialInfo.DefaultBranch
-  $officialRef = $OfficialInfo.OfficialRef
-  $officialHead = $OfficialInfo.OfficialHead
-  $officialShort = $OfficialInfo.OfficialShort
-  $forkMasterRef = "$ForkRemoteName/$defaultBranch"
-
-  $forkHeadResult = Invoke-Git -GitArgs @('rev-parse', $forkMasterRef) -AllowFail
-  $forkHead = if ($forkHeadResult.ExitCode -eq 0) { Get-GitText $forkHeadResult } else { '' }
-  $forkNeedsSync = ($forkHead -eq '') -or ($forkHead -ne $officialHead)
-
-  if ($forkNeedsSync) {
-    Write-Host "Syncing fork $ForkRemoteName/$defaultBranch <- $officialRef @ $officialShort..."
-    # Push the official tip to fork master without touching the working tree.
-    # --force-with-lease refuses if origin/master moved since our fetch.
-    Invoke-Git -GitArgs @(
-      'push',
-      '--force-with-lease',
-      $ForkRemoteName,
-      "${officialRef}:refs/heads/${defaultBranch}"
-    ) | Out-Null
-    Write-Host "Fork $defaultBranch updated to official @ $officialShort"
-  } else {
-    Write-Host "Fork $ForkRemoteName/$defaultBranch already matches official @ $officialShort"
+function Copy-LocalDir {
+  param(
+    [Parameter(Mandatory = $true)][string]$From,
+    [Parameter(Mandatory = $true)][string]$To
+  )
+  if (-not (Test-Path -LiteralPath $From)) { return }
+  New-Item -ItemType Directory -Path $To -Force | Out-Null
+  $previousEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    # /E copies subdirs including empty; /NFL /NDL /NJH /NJS keep the console quiet.
+    & robocopy $From $To /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+    $code = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousEap
+  }
+  # robocopy: 0-7 are success; 8+ is failure.
+  if ($code -ge 8) {
+    throw "Failed to copy .local ($From -> $To); robocopy exit $code"
   }
 }
 
+function Save-LocalDir {
+  $localDir = Join-Path $Repo '.local'
+  $backup = Join-Path $env:TEMP ('dsh-local-preserve-' + [guid]::NewGuid().ToString('N'))
+  if (Test-Path -LiteralPath $localDir) {
+    Write-Host 'Preserving .local/ across official sync...'
+    Copy-LocalDir -From $localDir -To $backup
+  }
+  return $backup
+}
+
+function Restore-LocalDir {
+  param([string]$Backup)
+  $localDir = Join-Path $Repo '.local'
+  if (-not $Backup -or -not (Test-Path -LiteralPath $Backup)) { return }
+  Write-Host 'Restoring .local/ after official sync...'
+  Copy-LocalDir -From $Backup -To $localDir
+  Remove-Item -LiteralPath $Backup -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 function Ensure-LaunchForkMaster {
-  # Checkout the fork's master (official default) and launch from it.
-  # Does not create or switch to local/dev.
+  # Checkout fork master, merge official, keep tracked .local/.
   param([hashtable]$OfficialInfo)
 
   $defaultBranch = $OfficialInfo.DefaultBranch
@@ -187,19 +197,8 @@ function Ensure-LaunchForkMaster {
   $officialShort = $OfficialInfo.OfficialShort
   $forkMasterRef = "$ForkRemoteName/$defaultBranch"
 
-  # Launch helpers may be tracked only on local/dev; switching to official
-  # master would delete them. Snapshot then restore after checkout.
-  $preserveNames = @('Start-DSH-Source.bat', 'start-dsh-source.ps1')
-  $preserveRoot = Join-Path $env:TEMP ('dsh-launch-preserve-' + [guid]::NewGuid().ToString('N'))
-  New-Item -ItemType Directory -Path $preserveRoot | Out-Null
+  $localBackup = Save-LocalDir
   try {
-    foreach ($name in $preserveNames) {
-      $src = Join-Path $PSScriptRoot $name
-      if (Test-Path -LiteralPath $src) {
-        Copy-Item -LiteralPath $src -Destination (Join-Path $preserveRoot $name) -Force
-      }
-    }
-
     $current = Get-GitText (Invoke-Git -GitArgs @('branch', '--show-current') -AllowFail)
     $localMaster = Invoke-Git -GitArgs @('show-ref', '--verify', '--quiet', "refs/heads/$defaultBranch") -AllowFail
 
@@ -207,11 +206,10 @@ function Ensure-LaunchForkMaster {
       Write-Host "Already on launch branch '$defaultBranch'."
     } elseif ($localMaster.ExitCode -eq 0) {
       Write-Host "Checking out launch branch '$defaultBranch' (leaving other branches untouched)..."
-      # Discard only tracked conflicts that block the switch; .local helpers are restored below.
-      Invoke-Git -GitArgs @('switch', '--force', $defaultBranch) | Out-Null
+      Invoke-Git -GitArgs @('switch', $defaultBranch) | Out-Null
     } else {
       Write-Host "Creating local '$defaultBranch' from $officialRef..."
-      Invoke-Git -GitArgs @('switch', '--force', '-c', $defaultBranch, $officialRef) | Out-Null
+      Invoke-Git -GitArgs @('switch', '-c', $defaultBranch, $officialRef) | Out-Null
     }
 
     $workBranch = Get-GitText (Invoke-Git -GitArgs @('branch', '--show-current'))
@@ -219,23 +217,26 @@ function Ensure-LaunchForkMaster {
       throw "Expected to be on '$defaultBranch' but current branch is '$workBranch'."
     }
 
-    Invoke-Git -GitArgs @('reset', '--hard', $officialRef) | Out-Null
     Invoke-Git -GitArgs @('branch', '--set-upstream-to', $forkMasterRef, $defaultBranch) -AllowFail | Out-Null
 
-    if (-not (Test-Path -LiteralPath $PSScriptRoot)) {
-      New-Item -ItemType Directory -Path $PSScriptRoot -Force | Out-Null
-    }
-    foreach ($name in $preserveNames) {
-      $bak = Join-Path $preserveRoot $name
-      if (Test-Path -LiteralPath $bak) {
-        Copy-Item -LiteralPath $bak -Destination (Join-Path $PSScriptRoot $name) -Force
-      }
+    $behindText = Get-GitText (Invoke-Git -GitArgs @('rev-list', '--count', "HEAD..$officialRef") -AllowFail)
+    $behind = 0
+    if ($behindText -match '^\d+$') { $behind = [int]$behindText }
+
+    if ($behind -gt 0) {
+      Write-Host "Merging official $officialRef @ $officialShort into '$defaultBranch' ($behind commit(s))..."
+      Invoke-Git -GitArgs @('merge', '--no-edit', $officialRef) | Out-Null
+    } else {
+      Write-Host "Launch branch already contains official @ $officialShort"
     }
 
     $workShort = Get-GitText (Invoke-Git -GitArgs @('rev-parse', '--short', 'HEAD'))
-    Write-Host "Launch: $workBranch @ $workShort (fork $ForkRemoteName/$defaultBranch <- official $officialShort)"
+    Write-Host "Launch: $workBranch @ $workShort (fork $ForkRemoteName/$defaultBranch + official $officialShort)"
+
+    Write-Host "Pushing '$defaultBranch' to fork '$ForkRemoteName' (no force; keeps .local/)..."
+    Invoke-Git -GitArgs @('push', '-u', $ForkRemoteName, "HEAD:refs/heads/$defaultBranch") | Out-Null
   } finally {
-    Remove-Item -LiteralPath $preserveRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Restore-LocalDir -Backup $localBackup
   }
 }
 
@@ -259,7 +260,6 @@ function Sync-OfficialToForkAndPrepareWorkBranch {
   Invoke-Git -GitArgs @('fetch', $ForkRemoteName, '--prune') -AllowFail | Out-Null
 
   $officialInfo = Get-OfficialDefaultBranchInfo
-  Sync-ForkMasterFromOfficial -OfficialInfo $officialInfo
   Ensure-LaunchForkMaster -OfficialInfo $officialInfo
 }
 
@@ -394,7 +394,8 @@ if (-not (Test-Path $AppExecutable)) {
 Write-Host 'Starting DeepSeek Harness from source...'
 Write-Host "Repo: $Repo"
 Write-Host "UI:   $Url"
-Write-Host 'Sync: official -> fork master. Launch checks out and runs your fork master (not local/dev).'
+Write-Host 'Sync: merge official into fork master (no force-push, no reset --hard). Launch that master.'
+Write-Host '.local/ is git-tracked on the fork and copied back after checkout so launch files survive.'
 Write-Host ''
 
 # Machine/user OPENSSL_CONF may point at a missing file (e.g. Postgres etc
