@@ -47,3 +47,9 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
+# Local machine residue. Keep only the source-launch helpers.
+.local/*
+!.local/desktop-launch/
+.local/desktop-launch/*
+!.local/desktop-launch/start-dsh-source.ps1
+!.local/desktop-launch/Start-DSH-Source.bat
