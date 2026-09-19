@@ -5,10 +5,17 @@ $OfficialRemoteName = 'upstream'
 $OfficialRemoteUrl = 'https://github.com/deepseek-ai/deepseek-harness.git'
 # Writable home: your GitHub fork. Official is fetch-only; never push there.
 $ForkRemoteName = 'origin'
-$AppExecutable = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
-$AppArguments = @(
-  '--profile-directory=Default'
-)
+function Get-ChromeExecutable {
+  $candidates = @(
+    (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe')
+    (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe')
+    (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
+  ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+  if ($candidates.Count -eq 0) {
+    throw 'Google Chrome was not found. Install Chrome or open the printed URL manually.'
+  }
+  return $candidates[0]
+}
 $ReadyTimeout = [TimeSpan]::FromMinutes(3)
 $PollSeconds = 1
 $BuiltRevFile = Join-Path $PSScriptRoot 'built-at.rev'
@@ -386,8 +393,10 @@ if (-not $pnpm) {
   Show-Error 'pnpm not found. Enable corepack or install pnpm first.'
   exit 1
 }
-if (-not (Test-Path $AppExecutable)) {
-  Show-Error "DeepSeek Harness desktop app not found:`n$AppExecutable"
+try {
+  $AppExecutable = Get-ChromeExecutable
+} catch {
+  Show-Error $_.Exception.Message
   exit 1
 }
 
@@ -492,7 +501,7 @@ while ((Get-Date) -lt $deadline) {
   if ($null -ne $webUrl -and (Test-DshReady $webUrl)) {
     Write-Host 'Server is ready. Opening DeepSeek Harness in a Chrome app window.'
     Add-Content -LiteralPath $StartLogFile -Value "ready: $webUrl"
-    Start-Process -FilePath $AppExecutable -ArgumentList ($AppArguments + "--app=$webUrl")
+    Start-Process -FilePath $AppExecutable -ArgumentList @("--app=$webUrl")
     $opened = $true
     break
   }

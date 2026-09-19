@@ -1,14 +1,16 @@
 import { createRequire } from 'module'
 import { readFileSync, readdirSync, statSync, existsSync } from 'fs'
 import { join, dirname } from 'path'
+import { fileURLToPath } from 'url'
 import { spawnSync } from 'child_process'
 
+const repo = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 const name = '@deepseek-ai/dsh-commands'
 const roots = [
-  'D:/Project/deepseek-harness/package.json',
-  'D:/Project/deepseek-harness/packages/interaction/commands/package.json',
-  'D:/Project/deepseek-harness/apps/cli/package.json',
-  'D:/Project/deepseek-harness/packages/bundle/web-app/package.json',
+  join(repo, 'package.json'),
+  join(repo, 'packages/interaction/commands/package.json'),
+  join(repo, 'apps/cli/package.json'),
+  join(repo, 'packages/bundle/web-app/package.json'),
 ]
 
 for (const root of roots) {
@@ -33,6 +35,6 @@ for (const root of roots) {
   }
 }
 
-const rg = spawnSync('rg', ['-l', 'execute:images', 'D:/Project/deepseek-harness', '--glob', '!node_modules'], { encoding: 'utf8' })
+const rg = spawnSync('rg', ['-l', 'execute:images', repo, '--glob', '!node_modules'], { encoding: 'utf8' })
 console.log('rg execute:images:\\n' + (rg.stdout || '(none)'))
 console.log('rg err:\\n' + (rg.stderr || ''))
