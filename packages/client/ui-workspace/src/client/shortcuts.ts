@@ -57,6 +57,7 @@ export function createWorkspaceShortcutControls(): WorkspaceShortcutControls {
 
 /**
  * Register navigation commands against the existing workspace owner.
+ * Rename requires a nonblank main Conversation with no modal obscuring it.
  * @param ctx - plugin context with the shortcut, locale, and model services.
  * @param navigation - session creation and forking from the pointer controls' navigation service.
  * @param controls - browser-owned opening requests.
@@ -93,9 +94,10 @@ export function installWorkspaceShortcuts(
       const reason = addReason()
       return reason === null ? { status: 'handled', run: controls.add } : { status: 'blocked', reason }
     })
-  register('session.rename', () => t('rename.session.title'), ['rename session'], 'KeyR', ['primary', 'alt'], ['primary', 'shift'], () => {
+  register('session.rename', () => t('rename.session.title'), ['rename session'], 'KeyG', ['primary', 'alt'], ['primary', 'alt'], (context) => {
     const target = current()
-    return target === undefined ? { status: 'blocked', reason: t('shortcut.noSession') }
+    return target === undefined || target.blank || context.modal !== null || ctx.layout.panelInfo.getSnapshot().activePanelId !== null
+      ? { status: 'blocked', reason: t('shortcut.noSession') }
       : { status: 'handled', run: () => { controls.rename(target.id, target.title?.trim() ?? '') } }
   })
   register('session.fork', () => t('menu.fork'), ['fork session'], 'KeyF', ['primary', 'alt'], ['primary', 'shift'], () => {
@@ -103,6 +105,7 @@ export function installWorkspaceShortcuts(
     if (target === undefined) return { status: 'blocked', reason: t('shortcut.noSession') }
     if (target.blank) return { status: 'blocked', reason: t('shortcut.noCompletedTurn') }
     return { status: 'handled', run: () => {
+      // The main view owns history opening for this target.
       void navigation.forkSession(target.id).catch((error: unknown) => {
         // Client plugin bundles do not share error-class identity.
         const unavailable = error instanceof Error && error.name === 'SessionForkError'
