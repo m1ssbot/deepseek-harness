@@ -2,7 +2,7 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import type { ChatScrollPosition } from '../contract/slots.ts'
 import type { ChatSnapshot } from '../contract/snapshot.ts'
-import { createFlowMotion } from './flow-motion.ts'
+import { createFlowMotion, type InputFoldBox, type InputFoldDriver } from './flow-motion.ts'
 import { scrollMetrics, ScrollFollow, type ViewportMetrics } from './use-scroll-follow.ts'
 export type { ViewportMetrics } from './use-scroll-follow.ts'
 
@@ -37,6 +37,31 @@ interface ViewportElements {
   readonly spacer: HTMLElement | null
 }
 
+/** Reading policy that fold batches consult and report tail landings to. */
+export interface FoldReader {
+  /** Follow intent at batch start selects the tail landing; tail landings commit it. */
+  readonly follow: ScrollFollow
+  /** @param landing - the actual geometry after a batch landed at the tail. */
+  readonly landedAtTail: (landing: ViewportLanding) => void
+  /** @returns whether reader movement awaits sampling; until then follow intent is undecided. */
+  readonly pending: () => boolean
+}
+
+/** A top-level row a closing shrink may keep still, measured before the rows close. */
+interface ShrinkAnchor {
+  readonly element: HTMLElement
+  /** Distance from the row's top to the end of the content last painted. */
+  readonly fromEnd: number
+}
+
+/** Layout measured at the first instant hide of a commit; only the size observation of that frame uses it. */
+interface ClosingLayout {
+  /** The first visible row, then the rows above it within one scrollport. */
+  readonly rows: readonly ShrinkAnchor[]
+  /** Content height without fold room when the rows were measured. */
+  readonly content: number
+}
+
 interface PagingPosition {
   readonly row: HTMLElement
   readonly position: ChatScrollPosition
@@ -54,12 +79,26 @@ export class ChatViewport {
   private turns: ReturnType<ChatSnapshot['navigation']['items']> = []
   private observation: { top: number; landing: ViewportLanding | null } = { top: 0, landing: null }
   private paging: PagingPosition | null = null
+  private reader: FoldReader | null = null
+  /** Rows measured before an instant close; see {@link ChatViewport.keepAboveClosing}. */
+  private closing: ClosingLayout | null = null
+  /** Discards a closing measurement that no size observation consumed by the end of its frame. */
+  private closingFrame: number | null = null
+  /** Content height without fold room at the latest size observation: the content that frame painted. */
+  private settledContent = 0
+  /** The pending or running fold batch lands at the tail. */
+  private tailRequested = false
+  /** The tail request came from the reader's own input rather than from a content change. */
+  private tailInput = false
+  /** Switches the running batch to a tail landing; null while no batch runs. */
+  private retarget: (() => void) | null = null
   /** Transition state and row callbacks owned by this viewport's attachment. */
   readonly motion = createFlowMotion(
-    (px) => { this.reserveBelow(px) },
+    () => this.foldDriver(),
     (active) => {
       if (this.elements !== null) this.elements.scroller.style.overflowAnchor = active ? 'none' : ''
     },
+    (element) => { this.measureClosing(element) },
   )
 
   /**
@@ -81,6 +120,10 @@ export class ChatViewport {
     if (typeof ResizeObserver !== 'undefined') {
       this.observer = new ResizeObserver(() => {
         if (this.elements !== elements) return
+        // Read while layout is still clean, before this callback writes room or scroll positions. Those writes
+        // leave the content height unchanged, so it is also the content this frame paints.
+        this.settledContent = elements.scroller.scrollHeight - this.spacerHeight()
+        this.keepAboveClosing()
         this.reclaimBelow()
         this.invalidate()
         this.events?.resize()
@@ -96,6 +139,7 @@ export class ChatViewport {
     this.stopPreserving()
     this.motion.clear()
     if (this.elements !== null) this.elements.scroller.style.overflowAnchor = ''
+    this.dropClosing()
     this.elements?.scroller.removeEventListener('scroll', this.onScroll)
     this.elements?.scroller.removeEventListener('scrollend', this.onScrollEnd, true)
     for (const type of READING_INTENTS) this.elements?.scroller.removeEventListener(type, this.onIntent, true)
@@ -103,6 +147,9 @@ export class ChatViewport {
     this.observer = null
     this.elements = null
     this.events = null
+    this.tailRequested = false
+    this.tailInput = false
+    this.retarget = null
     this.turns = []
     this.observation = { top: 0, landing: null }
   }
@@ -151,17 +198,386 @@ export class ChatViewport {
   }
 
   /**
-   * Add room below the flow before rows above the reader close, so the scrollport never clamps:
-   * the closing gap pulls the content below it upward while everything above stays put.
-   * @param px - height about to leave the flow.
+   * Connect the reading policy that fold batches consult.
+   * @param reader - follow intent and the tail-landing commit.
+   * @returns a disposer that disconnects only this reader.
    */
-  reserveBelow(px: number): void {
-    if (px <= 0) return
-    this.setSpacer(this.spacerHeight() + px)
+  bindReader(reader: FoldReader): () => void {
+    this.reader = reader
+    return () => { if (this.reader === reader) this.reader = null }
+  }
+
+  /**
+   * Land the pending or running fold batch at the tail instead of starting a separate scroll.
+   * @param follow - follow controller whose native animation yields to the batch.
+   * @param input - whether the reader's own input requests the landing; a content change, such as a Turn
+   * ending, requests it in place of the immediate follow.
+   * @returns whether a fold owns the tail movement.
+   */
+  followInputFold(follow: ScrollFollow, input: boolean): boolean {
+    // Rows still closing on CSS transitions after a batch have no batch to consume the request.
+    if (this.elements === null || this.reader === null || !this.motion.inputActive()) return false
+    this.interruptFollow(follow)
+    this.tailRequested = true
+    this.tailInput ||= input
+    this.retarget?.()
+    return true
+  }
+
+  /**
+   * Drive one fold batch on its frame clock. A tail landing ends at the floor, never above the reader's
+   * compensated position; a reader landing keeps the visible content still. Both install only the room
+   * the landing lacks.
+   * @returns the batch driver, or null while detached or without a reading policy.
+   */
+  private foldDriver(): InputFoldDriver | null {
+    const elements = this.elements
+    const reader = this.reader
+    if (elements === null || reader === null) return null
+    const { follow } = reader
+    let tail = false
+    let start = 0
+    let base = 0
+    let target = 0
+    let removed = 0
+    let growth = 0
+    let initialHeight = 0
+    let finalRoom = 0
+    let previousColumnHeight = 0
+    let previousProgress = 0
+    let segmentProgress = 0
+    let segmentTop = 0
+    let written = 0
+    const closing: InputFoldBox[] = []
+    const travelling = new Set<HTMLElement>()
+    // A visible row outside the batch measures spacing that snaps when the batch starts and ends.
+    let reference: HTMLElement | null = null
+    let referenceTop = 0
+    let viewportTop = 0
+    const screenTop = (element: HTMLElement): number => element.getBoundingClientRect().top - viewportTop
+    const aim = (): void => {
+      const finalHeight = initialHeight - removed + growth
+      const height = elements.scroller.clientHeight
+      target = tail ? Math.max(base, finalHeight - height, 0) : base
+      finalRoom = target === 0 ? 0 : Math.max(0, target + height - finalHeight)
+    }
+    const restart = (): void => {
+      segmentTop = elements.scroller.scrollTop
+      segmentProgress = previousProgress
+    }
+    const automatic = (cancelled: boolean): boolean => !(cancelled && tail)
+    const position = (progress: number, cancelled: boolean): number => {
+      if (!automatic(cancelled)) return elements.scroller.scrollTop
+      const remaining = segmentProgress === 1 ? 1 : (progress - segmentProgress) / (1 - segmentProgress)
+      return segmentTop + (target - segmentTop) * remaining
+    }
+    const room = (top: number, progress: number, cancelled: boolean): number => Math.max(
+      automatic(cancelled) ? finalRoom : 0,
+      top + elements.scroller.clientHeight - (initialHeight + (growth - removed) * progress),
+    )
+    return {
+      begin: (boxes) => {
+        // Own input lands at the tail; otherwise an unsampled reading movement outranks follow intent.
+        tail = this.tailRequested || (follow.active && !reader.pending())
+        const input = this.tailInput
+        this.tailRequested = false
+        this.tailInput = false
+        viewportTop = elements.scroller.getBoundingClientRect().top
+        start = elements.scroller.scrollTop
+        const originalRoom = this.spacerHeight()
+        initialHeight = Math.max(elements.column.offsetHeight, elements.scroller.scrollHeight - originalRoom)
+        if (tail && !input) {
+          // The batch replaces the immediate follow of a reader pinned to the tail, following content that
+          // overflows with no fold room: content that grew outside the batch since that paint, such as a Turn's
+          // duration control, is taken before the first frame as following takes streaming growth, so the
+          // batch only animates its own rows.
+          const pinned = originalRoom === 0 && this.settledContent > elements.scroller.clientHeight
+            && follow.active && !reader.pending() && !follow.animating
+          const external = elements.scroller.scrollHeight - originalRoom - this.settledContent
+          if (external > 0.5 && pinned) {
+            elements.scroller.scrollTop = start + external
+            start = elements.scroller.scrollTop
+            this.observation = { top: start, landing: null }
+          }
+        }
+        let above = 0
+        const below: HTMLElement[] = []
+        for (const box of boxes) {
+          const amount = box.height + box.marginTop
+          const top = box.element.getBoundingClientRect().top - box.marginTop
+          if (box.closing) {
+            removed += amount
+            above += Math.max(0, Math.min(amount, viewportTop - top))
+            if (top >= viewportTop) below.push(box.element)
+            closing.push(box)
+          } else {
+            growth += amount
+            if (top < viewportTop) above -= amount
+          }
+        }
+        if (!tail) reference = this.readingReference()
+        const referenceBefore = reference === null ? 0 : screenTop(reference)
+        elements.column.dataset.inputFold = ''
+        if (reference !== null) {
+          referenceTop = screenTop(reference)
+          above -= referenceTop - referenceBefore
+        }
+        base = Math.max(0, start - above)
+        segmentTop = start
+        written = start
+        previousColumnHeight = elements.column.offsetHeight
+        aim()
+        // This reserve only prevents an intermediate clamp; the final frame installs the exact deficit.
+        this.setSpacer(Math.max(originalRoom, finalRoom, removed))
+        if (tail) follow.setFollowing(true)
+        // A newer tail request also takes over a batch whose target a reading gesture cancelled.
+        this.retarget = () => {
+          tail = true
+          follow.setFollowing(true)
+          this.motion.resumeInput()
+          aim()
+          restart()
+          if (target <= segmentTop) return
+          for (const box of closing) {
+            // A box fading in place carries a visual translate; its layout position excludes it.
+            const shift = Number.parseFloat(box.element.style.translate.split(' ')[1] ?? '') || 0
+            if (box.element.getBoundingClientRect().top - shift - box.marginTop >= viewportTop) travelling.add(box.element)
+          }
+        }
+        // Scrolling forward past closing rows shows them shrinking; faded rows would leave their space empty.
+        if (tail && target > start) for (const element of below) travelling.add(element)
+        return travelling
+      },
+      prepare: (progress, cancelled) => {
+        if (this.elements !== elements) return
+        if (!tail) {
+          // Reader scrolling between frames moves the reading position the batch keeps still.
+          const drift = elements.scroller.scrollTop - written
+          if (Math.abs(drift) > 0.5) {
+            base = Math.max(0, base + drift)
+            segmentTop += drift
+            // The reference moves on screen with the reader's scroll; only layout changes are corrected.
+            referenceTop -= drift
+            aim()
+          }
+        }
+        const added = elements.column.offsetHeight - previousColumnHeight
+        if (added !== 0) {
+          initialHeight += added
+          aim()
+          restart()
+        }
+        const top = position(progress, cancelled)
+        // Growing the room before shrinking boxes avoids a native clamp between writes.
+        this.setSpacer(Math.max(this.spacerHeight(), room(top, progress, cancelled)))
+      },
+      frame: (progress, cancelled) => {
+        if (this.elements !== elements) return 0
+        const top = position(progress, cancelled)
+        elements.scroller.scrollTop = top
+        this.setSpacer(room(top, progress, cancelled))
+        written = elements.scroller.scrollTop
+        // Earlier frames keep the reference still; only its final position is compared at finish.
+        if (reference !== null && progress === 1) referenceTop = screenTop(reference)
+        if (automatic(cancelled)) this.observation = { top: written, landing: null }
+        previousColumnHeight = elements.column.offsetHeight
+        previousProgress = progress
+        return written - start
+      },
+      finish: (cancelled) => {
+        this.retarget = null
+        this.tailRequested = false
+        this.tailInput = false
+        if (this.elements !== elements) return
+        // Commit the final sibling margins while their fold transition override still applies.
+        void elements.column.offsetHeight
+        delete elements.column.dataset.inputFold
+        if (!tail || cancelled) {
+          if (!tail && reference?.isConnected === true && reference.closest('[hidden]') === null) {
+            // Committing the hidden rows settles their neighbours' spacing; keep the reference still.
+            const shift = screenTop(reference) - referenceTop
+            if (Math.abs(shift) > 0.5) {
+              const top = elements.scroller.scrollTop + shift
+              const content = elements.scroller.scrollHeight - this.spacerHeight()
+              this.setSpacer(Math.max(this.spacerHeight(), top + elements.scroller.clientHeight - content))
+              elements.scroller.scrollTop = top
+            }
+          }
+          const metrics = scrollMetrics(elements.scroller)
+          const height = elements.scroller.scrollHeight - this.spacerHeight()
+          this.setSpacer(metrics.top === 0 ? 0 : Math.max(0, metrics.top + metrics.height - height))
+          if (tail) this.invalidate()
+          else this.observation = { top: elements.scroller.scrollTop, landing: null }
+          return
+        }
+        // The estimate can differ from the committed layout, for example settled sibling spacing.
+        // Land on the actual content: never above the target, and at the real floor when content reaches past it.
+        const content = elements.scroller.scrollHeight - this.spacerHeight()
+        const clientHeight = elements.scroller.clientHeight
+        const top = Math.max(target, content - clientHeight, 0)
+        this.setSpacer(top === 0 ? 0 : Math.max(0, top + clientHeight - content))
+        elements.scroller.scrollTop = top
+        const metrics = scrollMetrics(elements.scroller)
+        const landing = { metrics, position: null, turn: this.latestTurn }
+        this.observation = { top: metrics.top, landing }
+        reader.landedAtTail(landing)
+      },
+    }
+  }
+
+  /**
+   * Find the first visible top-level row at or below the scrollport top that holds no batch box.
+   * Binary search over the ordered top-level rows reads O(log n) boxes.
+   * @returns the reference row, or null when every visible row folds.
+   */
+  private readingReference(): HTMLElement | null {
+    const elements = this.elements
+    if (elements === null) return null
+    const viewport = elements.scroller.getBoundingClientRect()
+    // Slot anchors use display:contents: their children are the top-level rows.
+    const rows = (elements.column.querySelector(':scope > [data-slot="conversation.chat.flow"]') ?? elements.column).children
+    let low = 0
+    let high = rows.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      if ((rows[middle] as Element).getBoundingClientRect().bottom > viewport.top) high = middle
+      else low = middle + 1
+    }
+    for (let index = low; index < rows.length; index++) {
+      const row = rows[index] as HTMLElement
+      if (row.hasAttribute('hidden')) continue
+      const rect = row.getBoundingClientRect()
+      if (rect.top >= viewport.bottom) return null
+      if (rect.height === 0 || rect.bottom <= viewport.top) continue
+      if (row.hasAttribute('data-chat-motion') || row.querySelector('[data-chat-motion]') !== null) continue
+      return row
+    }
+    return null
+  }
+
+  /**
+   * Measure, before the first row of a commit closes at once, the rows a following reader's shrink keeps
+   * still: the first row visible in the last painted layout, the rows after it that were on screen, and the
+   * rows above it within one scrollport.
+   * Rows above the closing rows keep their painted screen positions, which the commit did not move; the same
+   * commit can add rows between them and the closing rows, as a Turn's duration control does, so rows from
+   * the closing rows on are placed against the current end. Reads happen only when rows close, never on the
+   * following path's size observations. A measurement the same frame's size observation does not use is
+   * discarded after that frame.
+   * @param element - the first row of this commit to close.
+   */
+  private measureClosing(element: HTMLElement): void {
+    const elements = this.elements
+    const reader = this.reader
+    if (elements === null || reader === null || this.closing !== null || !element.isConnected) return
+    if (!reader.follow.active || reader.follow.animating || reader.pending()) return
+    if (this.paging !== null || this.motion.foldActive() || this.motion.inputActive()) return
+    const scroller = elements.scroller
+    const scrollHeight = scroller.scrollHeight
+    const height = scroller.clientHeight
+    // The commit has not moved the scroll position, so it is the painted one, within the follow threshold too.
+    const painted = scroller.scrollTop + height
+    const origin = scroller.getBoundingClientRect().top - scroller.scrollTop
+    const rows = (elements.column.querySelector(':scope > [data-slot="conversation.chat.flow"]') ?? elements.column).children
+    // End is the content end each row is placed against: painted for rows above the closing rows.
+    const end = (row: Element): number => row !== element && !row.contains(element)
+      && (element.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_PRECEDING) !== 0 ? painted : scrollHeight
+    const screen = (row: Element, offset: number): number => offset - origin - (end(row) - height)
+    let low = 0
+    let high = rows.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      const row = rows[middle] as Element
+      if (screen(row, row.getBoundingClientRect().bottom) > 0) high = middle
+      else low = middle + 1
+    }
+    let first = -1
+    for (let index = low; index < rows.length && first < 0; index++) {
+      const row = rows[index] as HTMLElement
+      const rect = row.getBoundingClientRect()
+      if (screen(row, rect.top) >= height) break
+      if (rect.height > 0 && !row.hasAttribute('hidden')) first = index
+    }
+    if (first < 0) return
+    const anchors: ShrinkAnchor[] = []
+    const add = (row: HTMLElement, rect: DOMRect): void => {
+      if (rect.height > 0 && !row.hasAttribute('hidden')) anchors.push({ element: row, fromEnd: end(row) - (rect.top - origin) })
+    }
+    add(rows[first] as HTMLElement, (rows[first] as HTMLElement).getBoundingClientRect())
+    // When the first visible row closes, the reader's eyes are on the rows that follow it on screen.
+    for (let index = first + 1; index < rows.length; index++) {
+      const row = rows[index] as HTMLElement
+      const rect = row.getBoundingClientRect()
+      if (screen(row, rect.top) >= height) break
+      add(row, rect)
+    }
+    for (let index = first - 1; index >= 0; index--) {
+      const row = rows[index] as HTMLElement
+      const rect = row.getBoundingClientRect()
+      if (screen(row, rect.bottom) <= -height) break
+      add(row, rect)
+    }
+    this.closing = { rows: anchors, content: scrollHeight - this.spacerHeight() }
+    if (typeof requestAnimationFrame === 'function') {
+      // This frame's size observation runs before the second callback; nothing later may use the measurement.
+      this.closingFrame = requestAnimationFrame(() => {
+        this.closingFrame = requestAnimationFrame(() => {
+          this.closingFrame = null
+          this.closing = null
+        })
+      })
+    }
+  }
+
+  private dropClosing(): void {
+    this.closing = null
+    if (this.closingFrame !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.closingFrame)
+    this.closingFrame = null
+  }
+
+  /**
+   * Keep a following reader's content still after rows closed at once, for example work details at Turn
+   * completion: the first visible row keeps its screen position, or, when it closed, the first surviving row
+   * that followed it on screen, else the nearest surviving row above it. Room below fills the gap, at most half
+   * the scrollport; beyond that the content end stops at the scrollport's middle. Called from the size
+   * observation, after layout and before paint; only the observation of the frame that closed the rows uses
+   * the measurement, and only while the reader still follows the tail with no fold batch, native animation,
+   * unsampled movement, or paging writing positions.
+   */
+  private keepAboveClosing(): void {
+    const closing = this.closing
+    const elements = this.elements
+    const reader = this.reader
+    if (closing === null) return
+    this.dropClosing()
+    if (elements === null || reader === null || !reader.follow.active || reader.follow.animating || reader.pending()) return
+    if (this.paging !== null || this.motion.foldActive() || this.motion.inputActive()) return
+    const scroller = elements.scroller
+    const content = scroller.scrollHeight - this.spacerHeight()
+    // Growth in the same commit can outweigh the closed rows; nothing then shrank to compensate.
+    if (content >= closing.content - 0.5) return
+    const height = scroller.clientHeight
+    const origin = scroller.getBoundingClientRect().top - scroller.scrollTop
+    const cap = height / 2
+    let top = content + cap - height
+    for (const row of closing.rows) {
+      if (!row.element.isConnected || row.element.closest('[hidden]') !== null) continue
+      const rect = row.element.getBoundingClientRect()
+      if (rect.height === 0) continue
+      top = rect.top - origin - (height - row.fromEnd)
+      break
+    }
+    if (top + height - content > cap) top = content + cap - height
+    top = Math.max(0, top)
+    this.setSpacer(top === 0 ? 0 : Math.max(0, top + height - content))
+    if (scroller.scrollTop !== top) scroller.scrollTop = top
+    const metrics = scrollMetrics(scroller)
+    this.observation = { top: metrics.top, landing: { metrics, position: null, turn: this.latestTurn } }
   }
 
   /** Clear fold reservations after a display-mode change, allowing the scroll range to shrink. */
   resetBelow(): void {
+    this.dropClosing()
     this.setSpacer(0)
     this.invalidate()
   }

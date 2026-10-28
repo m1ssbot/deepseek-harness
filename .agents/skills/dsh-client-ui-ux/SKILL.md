@@ -7,6 +7,13 @@ description: Design and review DeepSeek Harness client UI changes — visual tok
 
 This skill is guidance, not a complete checklist. It covers judgment calls that lint, typecheck, and the i18n gate cannot make: where feedback appears, what gets reused, and how surfaces behave at window edges and across platforms. Copy quality itself follows [dsh-prose-standard](../dsh-prose-standard/SKILL.md); locale ownership follows the [locale-owned copy decision](../../notes/implemented/architecture/2026-08-23-locale-owned-client-ui-copy.md); styling ownership and token rules live in [docs/web-styling.md](../../../docs/web-styling.md) and the [ui-primitives component catalog](../../../packages/client/ui-primitives/README.md#component-catalog) — this skill adds judgment on top of those rules, not a second copy of them.
 
+## Architecture prerequisites
+
+Component structure, state flow, and effect usage follow the architecture rules; read them before redesigning a component:
+
+- [packages/client/AGENTS.md](../../../packages/client/AGENTS.md) — Slot and props discipline, reactive read, export, ctx, and layering rules.
+- [Client component rules](../../../docs/defensive-patterns/client-components.md) — those requirements stated with the defects they prevent.
+
 ## Visual foundation
 
 - **Use existing tokens for color, radius, and spacing.** Before introducing a literal value, search the target page and its nearest established sibling (the Plugins page is the usual reference for full-page surfaces) for the token or value already in use, and adopt it. The same applies to whole treatments — toasts, menus, in-message artifact previews, sidebar tab layout, colors, clearance rules, page padding: reuse the established component or rule wherever one exists instead of inventing a parallel one.
@@ -47,6 +54,10 @@ Every menu, popover, and tooltip must be verified for all three before merge:
 
 Scrollbars stay inside their container: use the shared scrollbar styles rather than component-specific selectors, and verify the bar neither overflows the container nor gets clipped by its rounded corners or edges — keep a small inset instead of letting it sit flush against the container edge.
 
+## Responsive layouts
+
+Use [dsh-responsive-ui](../dsh-responsive-ui/SKILL.md) for responsive layouts, mobile and touch detection, text truncation, title wrapping, icon-only controls, and focus during width changes.
+
 ## Platform window adaptation
 
 - Any new header element or full page must account for macOS and Windows window chrome. On macOS the titlebar clearance is `--dsh-frame-top-clearance`, consumed by Menu, Modal, and overlay primitives as their top safe margin — **never change the global variable to fix one page**. Add a scoped `[data-platform='darwin']` override on the page's own inset instead, and assert the override in the page's stylesheet spec.
@@ -56,6 +67,10 @@ Scrollbars stay inside their container: use the shared scrollbar styles rather t
 
 - Review every changed region for gaps: nothing sits flush against its neighbour without an intentional gap, and adjacent icons and elements keep the region's established spacing.
 - Prefer symmetry for parallel elements; an unexplained one-off gap or offset usually signals a missed shared value.
+- **For complex pages and containers, establish shared horizontal and vertical alignment axes before adjusting local spacing.** Consider hover, selected, and expanded/collapsed states, as well as the overall relationship with adjacent panels and other page elements. Choose from the following references according to layout similarity:
+  - **Sidebar:** align corresponding text starts and leading icons across vertically stacked rows. Align hover and selected row backgrounds with the buttons above the list to maintain visual balance.
+  - **Plugins page:** keep content left-aligned along a shared edge. List-row hover backgrounds may extend beyond that edge while the content stays in place.
+  - **Conversation and right-sidebar headers:** align the first header rows across both panels and match their heights. Apply the same rule to the second rows, and align corresponding underlines and dividers on shared horizontal baselines.
 
 ## Design review escalation
 

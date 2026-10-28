@@ -284,11 +284,18 @@ export class PtcWorkflowRun implements WorkflowRun {
     try {
       const cwd = await this.cwd
       this.requireActive()
+      if (this.runtime.sandboxMode === undefined && this.policy.mode !== 'danger-full-access') {
+        throw new Error(`workflow runtime cannot enforce the ${this.policy.mode} file policy`)
+      }
       const outcome = await this.runtime.run(this.runtime.resolve({
-        program: PROGRAM,
+        program: {
+          'function-body': PROGRAM,
+          repl: `await (async () => {\n${PROGRAM}\n})()`,
+          script: `(async () => {\n${PROGRAM}\n})()`,
+        }[this.runtime.programFormat],
         bindings: [{ global: 'workflowHost', functions: this.bindings() }],
         cwd,
-        sandboxPolicy: this.policy,
+        ...this.runtime.sandboxMode === undefined ? {} : { sandboxPolicy: this.policy },
         timeoutMs: null,
         signal: this.controller.signal,
       }))
