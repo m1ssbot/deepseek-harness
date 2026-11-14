@@ -37,9 +37,11 @@ python/**/__pycache__/
 python/**/.pytest_cache/
 packages/**/__pycache__/
 apps/web/dist/
+apps/cli/docs/
 .artifacts/
 .dsh-build/
 .dsh-report/
+.ui-review/
 .playwright-mcp/
 .orig
 .worktrees/
@@ -53,3 +55,6 @@ native/system/test/bin/
 .local/**/built-at.rev
 .local/stale-quarantine/
 .local/**/node_modules/
+
+# Generated company-signed CUA release record.
+/packages/experimental/cua-macos/cua-helper.json

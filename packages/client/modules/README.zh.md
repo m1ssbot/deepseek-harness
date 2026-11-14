@@ -36,7 +36,7 @@ kind: "package-reference"
 <a id="package-assets"></a>
 ### 包资源
 
-同一个 `/plugins` 路由也提供客户端包通过其 `"./assets/*": "./lib/assets/*"` 导出发布的图片。构建会产出每个被引用的资源，在扩展名之前插入其内容 revision（资源字节 SHA-1 摘要的前 12 位十六进制数字），并把 import 或样式表 `url()` 编译成对 bundle 模块加载器的同步调用 `require.asset("plugins/<package>/assets/<emitted path>")`，因此一个 URL 始终对应一份内容。每个路径段先用 `encodeURIComponent` 编码，再编码 `!`、`'`、`(`、`)` 和 `*`，因此引用本身也是合法的无引号 CSS `url()`；仓库外构建的包必须输出同样的形式。除非页面的载体提供了 `resolveAsset`，这个调用都返回文档相对引用；WebWorker 预览的页面无法请求该引用，它把引用映射为 Worker 镜像中对应字节的 Blob URL。任何 `/plugins/<package>/assets/` 路径都只由资源路由响应：对于活动的客户端 row，Host 对路径做一次百分号解码，并从该包自身的 manifest（元数据清单）出发，用 Node 的 `require.resolve` 解析 `<package>/assets/<path>`，因此由包的导出决定哪些文件存在。无法解析的路径、扩展名不是 `.svg`、`.png`、`.webp`、`.jpg` 或 `.jpeg` 的已解析文件、格式错误的转义以及未激活的包都返回 404；查询串不参与选择。提供的资源每次请求都从磁盘流式读取且不缓存，并携带其媒体类型、与 bundle 相同的 `cache-control: public, max-age=31536000, immutable`、`etag: "<requested path>"` 和 `x-content-type-options: nosniff`；SVG 还额外携带 `content-security-policy: script-src 'none'`，因此直接打开的 SVG 不会运行脚本。`If-None-Match` 等于该 etag 时返回 304 且不打开文件，`HEAD` 的响应不带 body。`fetchBundle()` 返回相同的响应，其流式 body 在取消时关闭文件。
+同一个 `/plugins` 路由也提供客户端包通过其 `"./assets/*": "./lib/assets/*"` 导出发布的图片。构建会产出每个被引用的资源，在扩展名之前插入其内容 revision（资源字节 SHA-1 摘要的前 12 位十六进制数字），并把 import 或样式表 `url()` 编译成同步资源解析调用（JavaScript 使用 `require.asset`，样式表 `text` 使用 `context.asset`），因此一个 URL 始终对应一份内容。每个路径段先用 `encodeURIComponent` 编码，再编码 `!`、`'`、`(`、`)` 和 `*`，因此引用本身也是合法的无引号 CSS `url()`；仓库外构建的包必须输出同样的形式。除非页面的载体提供了 `resolveAsset`，这个调用都返回文档相对引用；WebWorker 预览的页面无法请求该引用，它把引用映射为 Worker 镜像中对应字节的 Blob URL。任何 `/plugins/<package>/assets/` 路径都只由资源路由响应：对于活动的客户端 row，Host 对路径做一次百分号解码，并从该包自身的 manifest（元数据清单）出发，用 Node 的 `require.resolve` 解析 `<package>/assets/<path>`，因此由包的导出决定哪些文件存在。无法解析的路径、扩展名不是 `.svg`、`.png`、`.webp`、`.jpg` 或 `.jpeg` 的已解析文件、格式错误的转义以及未激活的包都返回 404；查询串不参与选择。提供的资源每次请求都从磁盘流式读取且不缓存，并携带其媒体类型、与 bundle 相同的 `cache-control: public, max-age=31536000, immutable`、`etag: "<requested path>"` 和 `x-content-type-options: nosniff`；SVG 还额外携带 `content-security-policy: script-src 'none'`，因此直接打开的 SVG 不会运行脚本。`If-None-Match` 等于该 etag 时返回 304 且不打开文件，`HEAD` 的响应不带 body。`fetchBundle()` 返回相同的响应，其流式 body 在取消时关闭文件。
 
 ### 浏览器加载什么
 
@@ -75,11 +75,17 @@ application combo 脚本只携带每个插件的 `client.js` 入口，并在启�
 
 ### 惰性 CJS 模型
 
-执行插件 bundle 只注册其 factory；每个模块主体副作用（包括 CSS 注入）都位于 factory 闭包中，在物化时运行（`factory(require)` → 导出，在 `loadCache` 中记忆化）。factory 依赖另一个已注册但未物化的模块时会递归物化它；require 循环会抛出异常，因为 factory 形式的 CJS 无法提供部分导出。解析会依次检查平台 seed 表、已记忆记录、启动图 row 与已注册 factory；其他情况一律抛错。交给 factory 的同步 `require` 使用相同顺序，但不含异步图 row 加载，并把观察到的边记录到模块记录中。它的 `require.async` 操作返回 Promise，并在一次性物化编译器生成的包内 chunk 前先获取该 chunk。该协议只支持自包含 chunk：入口与 chunk 产物不能同步 require 另一个相对 `client*.js` 产物。
+执行插件 bundle 只登记其 factory 和可选的 `meta`，不调用它们。首次 import 或同步 require 会物化 JavaScript 并缓存导出；递归 require 环会被拒绝。模块记录保留 `ownerId`、观察到的依赖边和传入的 `meta`，不会为缺失的生产函数补值。Modules 不求值样式元信息，只向消费者提供 `activeRecords()`、`subscribeModules()` 和载体资源解析器。`activeRecords()` 列出所有已物化记录，以及正在实时替换的包的旧记录；旧记录保留到其旧运行时完成卸载。[Renderer](../ui-renderer/README.zh.md) 负责元信息求值与样式安装。包内 `require.async()` 保持惰性到达及所属模块身份。
+
+### Main 执行环境
+
+模块系统围绕 `loadBundle` 构造自身的 Main Realm；未提供载体 hook 时使用原有页面脚本传输。默认启动仍先预取 immediate 层级，再创建 Loader entries，不要求 Realm 注册表或隔离配置。`dispose()` 停止接受新脚本并等待进行中的载体操作，不取消这些操作。可选的 [Realm 注册表](../script-realm/README.zh.md)和 [iframe 提供方](../script-realm-iframe/README.zh.md)不参与默认路径。
 
 ### 增量组合
 
-Node 半侧逐包增量扫描——没有全量重扫路径。每次发出 `internal/plugin` 事件时，系统都会把该 fiber 的 entry 名标脏；微任务 flush 会把每个脏名与当前 loader 条目对账，激活 pass 会初始化同一个脏集合并同步 flush，因此首次扫描与稳态共用同一实现。每次对账都会重新读取包 manifest 与 bundle 元数据，因此包在重新安装、升级或移动之后重启的条目会发布其当前的 `dsh.client` 声明与客户端导出；读到相同 manifest 与 bundle 元数据的对账不发布任何内容，也不读取 bundle 字节；未变化的 bundle 保留其 revision，因此浏览器会保留已加载的插件。解析出的 manifest 包名作为浏览器模块身份。若不同的 active Loader source 解析到同一包名，组合会失败；移除冲突来源后，剩余来源无需重启 fiber 即可接替。没有伴随条目重启的 bundle 重建经 `rebuilt()`（HMR 钩子）进入图。
+Node 半侧按 Loader entry 名对包进行对账。每次发出 `internal/plugin` 事件时，系统都会把该 fiber 的 entry 名标脏。每次非空 flush（包括同步执行的激活 flush）遍历全部 Loader entries 一次，按 entry 名构建临时索引，再查询待处理名称进行对账。包解析过程不得在对账期间同步添加或移除 Loader entries。待处理名称若不在索引中，则以空 entry 列表对账，移除已卸载的来源；所有同名 entry 都保留，用于来源去重与冲突检查。激活 pass 初始化同一组待处理名称并同步 flush，因此首次激活与稳态共用同一实现。每次对账都会重新读取包 manifest 与 bundle 元数据，因此包在重新安装、升级或移动之后重启的条目会发布其当前的 `dsh.client` 声明与客户端导出；读到相同 manifest 与 bundle 元数据的对账不发布任何内容，也不读取 bundle 字节；未变化的 bundle 保留其 revision，因此浏览器会保留已加载的插件。解析出的 manifest 包名作为浏览器模块身份。若不同的 active Loader source 解析到同一包名，组合会失败；移除冲突来源后，剩余来源无需重启 fiber 即可接替。没有伴随条目重启的 bundle 重建经 `rebuilt()`（HMR 钩子）进入图。
+
+如果 flush 期间 Loader 枚举失败，注册表会消费失败批次，但不修改包状态或已发布的图。激活阶段通过组合错误报告失败；稳态下记录警告。只有收到该名称的另一次条目通知后，才会重试。
 
 Node 半侧会在发布前快照每个 `client.js` 入口，并在不构建响应 body 的情况下创建 combo descriptor。它把资源分组为 combo 路由键（`/plugins/??...&rev=...`）：modules row 使用一个 bootstrap combo，其余 row 使用一个或多个 application combo；每个阶段都会在 URL 超过 3 KiB 之前分区。启动图与批次描述符携带同一路由键的应用目录相对形式（`plugins/??...&rev=...`），浏览器文档会按其自身挂载解析它，而响应表仍以绝对路由为键；source-map trailer 则相对该 combo 脚本自身目录解析。脚本 body 在首次 `GET` 时只组合一次，并以对应的 map 引用结尾；map 文件则在首次 map `GET` 时单独读取、校验并组合，`HEAD` 不会物化任一 body。Host 不扫描也不预加载同级 chunk：精确的 `/plugins/<package>/client.<name>.js?rev=<rev>` 请求会通过异步文件 API 读取该脚本并缓存，因此首次异步读取时才物化文件的文件系统也能提供它；其 map 仍会等到 map URL 被请求后才计算。浏览器从所属 row 派生出该 chunk 引用，因此它同样是文档相对形式（`plugins/<package>/client.<name>.js?rev=<rev>`）；chunk 脚本携带的 map trailer 则是裸文件名 `client.<name>.js.map?rev=<rev>`，由该脚本自身目录解析。每个 combo 或 chunk map 都是 Indexed Source Map v3，并在可用时使用作者提供的 section，否则为已打包 bundle 生成 identity section。首次发布与 HMR 都从入口的 `mtimeMs`、`ctimeMs` 和大小派生逐插件 revision，不对产物内容求哈希。状态变更时间用于区分保留 mtime 和大小的重写。未变化的产物因此会跨 Host 重启保持 revision，SSE 重连不会替换其浏览器插件。共享预设会在该包所有输出写完后标记 `client.js`，因此仅 chunk 发生重建也会更换 owner revision，无需 Host 扫描 chunk。combo revision 从有序 row revision 派生。已公告的 combo 响应与已请求的 chunk 响应会跨无关图重组保持不可变；未知资源或 revision 返回 404。
 
@@ -91,7 +97,7 @@ bundle 路由随注入的 `webServer` 生命周期注册：服务就绪时注册
 
 ### 条目所有权
 
-`ClientEntries` 记录启动时创建的条目，并在同一个 Loader 上串行执行完整图更新、重试和代码重载。本地代际阻止旧下载在目标条目或代码变化后挂载；目标相同的快照共用进行中的加载。来自启动 release 以外 release 的图不进入队列：重试继续调和上次应用的图，Host 提供该 release 期间忽略 rebuilt 帧。新增模块使用单资源 URL，不会重新执行可能重复注册现有 factory 的启动 batch。Factory 在条目创建前就保留产物 revision；图更新会在导入消费者前丢弃未归属条目的陈旧 factory、其样式和失败的到达目标。清理会保留每个剩余 Loader 条目的已声明及已观察到的传递模块依赖。其可观察状态不导入运行时库，因为 modules bootstrap 在平台种子可用之前物化。
+`ClientEntries` 记录启动时创建的条目，并在同一个 Loader 上串行执行完整图更新、重试和代码重载。与 Host Loader 分组一样，启动时创建失败的条目（例如模块未导出插件）会记录日志并保持未激活，交由启动审计处理，而不会中止启动。本地代际阻止旧下载在目标条目或代码变化后挂载；目标相同的快照共用进行中的加载。来自启动 release 以外 release 的图不进入队列：重试继续调和上次应用的图，Host 提供该 release 期间忽略 rebuilt 帧。新增模块使用单资源 URL，不会重新执行可能重复注册现有 factory 的启动 batch。Factory 在条目创建前就保留产物 revision；图更新会在导入消费者前丢弃未归属条目的陈旧 factory、其物化记录和失败的到达目标。清理会保留每个剩余 Loader 条目的已声明及已观察到的传递模块依赖。其可观察状态不导入运行时库，因为 modules bootstrap 在平台种子可用之前物化。
 
 ### 源码索引
 
@@ -102,7 +108,7 @@ bundle 路由随注入的 `webServer` 生命周期注册：服务就绪时注册
 | [`src/client/index.ts`](src/client/index.ts) | 浏览器半侧：bootstrap 导出、`ctx.modules` 登记 |
 | [`src/client/system.ts`](src/client/system.ts) | `ClientModuleSystem`：加载／物化／失效机制 |
 | [`src/client/entries.ts`](src/client/entries.ts) | 页面条目对账、重试与代码替换 |
-| [`src/client/entry-lifecycle.ts`](src/client/entry-lifecycle.ts) | 通过注册表清理 Loader fiber，回收模块自身样式 |
+| [`src/client/entry-lifecycle.ts`](src/client/entry-lifecycle.ts) | 通过注册表清理 Loader fiber |
 | [`src/client/manifest.ts`](src/client/manifest.ts) | 协议类型、启动清单解析与 `dsh.client` 声明解析器 |
 
 </details>

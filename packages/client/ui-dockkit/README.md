@@ -60,6 +60,8 @@ Everything host-specific arrives through props:
 
 `dropZones="horizontal"` offers two half-pane hints; once budget or width forbids another split, the whole body accepts a move. A hint is a dashed card inset 8px inside its region, showing the zone's glyph and `labels.dropZone[zone]`; the preview layer covers all tab-body content, while the card under the pointer takes the accent and its neighbour stays a quiet outline. `minPaneFraction` sets the preview minimum, and `planResizeSplit` accepts the same minimum for the committed operation. The Sidebar uses 0.2 and enforces two panes in its own store. The generic engine retains its tree and other split directions. `hideSplitWhenBlocked` hides a blocked split control — pane budget spent or pane too narrow — instead of rendering it disabled; its default is false.
 
+The split control wrapper exposes `data-dockkit-split-control` for embedder styling, independently of its element tag.
+
 A tab's `kind` is an opaque string. Seeded tabs are factories (`DockControllerOptions`), so what a fresh pane contains is the embedder's decision, not this package's. Content identity is the pair (`kind`, `contentId`): `findContentTab(state, contentId, kind?)` finds the tab showing it anywhere and `findPaneContentTab(state, paneId, contentId, kind?)` within one pane, and `planOpenContent` focuses that tab instead of opening another unless told `revealIfOpened: false`; an explicit `index` seats a new tab at a strip slot rather than at the end.
 
 `DockLayout`, used by the Sidebar, keeps each tab in a stable DOM cell across selection, pane moves and floating. It accepts one docked pane or two horizontal panes; CSS Grid resolves their widths. `keepMounted(tab)` retains visited bodies and `active` controls Session visibility without reparenting content.
@@ -86,7 +88,7 @@ These are not stylistic; each one fixes a defect found in a real browser.
 <a id="build-shape"></a>
 ## Build shape
 
-The package is statically linked: tsdown's `staticLinked` preset emits one browser ESM bundle at `lib/index.js` (every bare specifier stays an import, sourcemaps chain to the sources) and ships the stylesheet under `lib/` at its `src`-relative path, and the Web shell resolves the package name and bundles that artifact itself, so vite stays the only owner of class hashing. One consequence is load-bearing — the kit keeps **one** stylesheet, `dockkit.module.css`, because a consumer de-duplicates injected sheets by file name and a collision would drop one silently.
+The package is statically linked: tsdown's `staticLinked` preset emits one browser ESM bundle at `lib/index.js` (every bare specifier stays an import, sourcemaps chain to the sources), and the Web shell resolves the package name and bundles that artifact itself. The preset compiles `dockkit.module.css` with class names of the form `<hash>_<local>` and carries its text in the bundle's `__$dsh_client_module_manifest` export; the renderer installs it as one style element with `data-plugin="@deepseek-ai/dsh-client-ui-dockkit"` and `data-path="src/components/dockkit.module.css"`.
 
 <a id="model-experience"></a>
 ## Model Experience

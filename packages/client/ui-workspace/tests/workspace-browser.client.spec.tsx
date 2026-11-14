@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
+import { contextMenuHook } from '@deepseek-ai/dsh-client-test-runtime'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { GlobalStandardProps } from '@deepseek-ai/dsh-client-ui-slots'
 import { Profiler } from 'react'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, createEvent, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { allowAllAccess, bindSnapshotSelector, makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
@@ -9,17 +10,18 @@ import type { SessionListState, SessionSummary } from '@deepseek-ai/dsh-api-sess
 import type {
   WorkspaceId, WorkspaceSnapshot, WorkspaceView,
 } from '@deepseek-ai/dsh-api-workspace-controller/client'
-import type {
-  SessionPendingInteraction, SessionStatus, SessionStatusSnapshot,
-} from '@deepseek-ai/dsh-client-ui-session/client'
+import type { SessionStatus, SessionStatusSnapshot } from '@deepseek-ai/dsh-client-ui-session-status/client'
+import type { SessionPendingInteraction } from '@deepseek-ai/dsh-client-ui-session/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
-import type { DirectoryFlowOwnerProps, WorkspaceBrowserProps } from '../src/client/contract/slots.ts'
+import type { DirectoryFlowOwnerProps, WorkspaceActionRequest, WorkspaceBrowserProps } from '../src/client/contract/slots.ts'
 import { createWorkspaceShortcutControls } from '../src/client/shortcuts.ts'
 import { createWorkspaceViewStore, FLAT_SESSION_ORDER_KEY } from '../src/client/stores.ts'
 import { UNGROUPED_KEY } from '../src/client/tree.ts'
 import { WorkspaceBrowser } from '../src/client/rows/WorkspaceBrowser.tsx'
+import { renderMenuButton } from './menu-button.tsx'
+import rowCss from '../src/client/rows/Rows.module.css'
 import { zh } from '../src/client/locales.ts'
 
 // Every fixture carries the resource hook the resources plugin merges into GlobalStandardProps.
@@ -106,10 +108,17 @@ const renderDirectoryFlowOnly: WorkspaceBrowserProps['renderSlot'] = (name: stri
     ? <div data-testid="directory-flow" />
     : null
 
+// Mounted outside a sidebar, the browser binds its list area to nothing.
+const SECTION_SCROLLER = { bindScrollerRef: () => {} }
+
 function mount(overrides: Partial<WorkspaceBrowserProps> = {}) {
   const controls = createWorkspaceShortcutControls()
+  const request = createSnapshotStore<WorkspaceActionRequest | null>(null)
   const store = createWorkspaceViewStore().create()
   const props: WorkspaceBrowserProps = {
+    useWorkspaceActionRequest: bindSnapshotSelector(request),
+    settleWorkspaceAction: () => { request.set(null) },
+    useContextMenuTarget: selector => selector(null),
     useShortcuts: select => select([]),
     useWorkspaceShortcuts: bindSnapshotSelector(controls.state),
     requestSearch: controls.search,
@@ -122,7 +131,9 @@ function mount(overrides: Partial<WorkspaceBrowserProps> = {}) {
     useSessions: hook(sessionState([])),
     useSessionStatus: hook(noPendingInteraction),
     useSessionRetainInfo: () => undefined,
-    usePanelInfo, useResource,
+    usePanelInfo,
+    useContextMenu: contextMenuHook(),
+    useResource,
     useWorkspaces: hook(workspaceState([])),
     ...allowAllAccess,
     useStore: bindSnapshotSelector(store),
@@ -131,6 +142,7 @@ function mount(overrides: Partial<WorkspaceBrowserProps> = {}) {
     open: vi.fn(),
     searchSessions: vi.fn(async () => ({ items: [], hasMore: false })),
     searchResultLimit: 20,
+    useSectionScroller: () => SECTION_SCROLLER,
     notifyArchivedNotOpenable: vi.fn(),
     renameWorkspace: vi.fn(async () => {}),
     deleteWorkspace: vi.fn(async () => {}),
@@ -140,11 +152,15 @@ function mount(overrides: Partial<WorkspaceBrowserProps> = {}) {
     useDirectoryFlow: bindSnapshotSelector({ getSnapshot: () => true, subscribe: () => () => {} }),
     useHostInfo: selector => selector({ home: undefined, isLoopback: true }),
     renderSlot: renderDirectoryFlowOnly,
+    renderFactorySlot: renderMenuButton,
     t,
     ...overrides,
   }
   const view = render(<WorkspaceBrowser {...props} />)
-  return { view, props, store, controls }
+  return { view, props, store, controls, openDialog: (workspaceId: WorkspaceId, displayTitle: string, action: 'rename' | 'delete') => {
+    const storedTitle = props.useWorkspaces(state => state.items.find(row => row.workspaceId === workspaceId)?.title ?? displayTitle)
+    act(() => { request.set({ action, workspaceId, displayTitle, storedTitle }) })
+  } }
 }
 
 /** Re-render with (possibly) changed props — WorkspaceBrowser has no side channel. */
@@ -154,6 +170,42 @@ function rerender(b: ReturnType<typeof mount>, overrides: Partial<WorkspaceBrows
 }
 
 describe('WorkspaceBrowser', () => {
+  it.each(['workspace', 'flat', 'ungrouped'] as const)('passes the standard menu factory through the %s list', (mode) => {
+    const preferences = createWorkspaceViewStore().create()
+    preferences.actions.setGroupBy(mode === 'flat' ? 'flat' : 'workspace')
+    preferences.actions.setGroupExpanded(mode === 'ungrouped' ? UNGROUPED_KEY : 'alpha', true)
+    const renderFactorySlot = vi.fn(renderMenuButton)
+    mount({
+      useSessions: hook(sessionState([summary('session-one', 10)])),
+      useWorkspaces: hook(workspaceState(mode === 'ungrouped' ? [] : [workspace('alpha', ['session-one'])])),
+      renderFactorySlot,
+    })
+    expect(renderFactorySlot).toHaveBeenCalledWith('contextMenu.button', {
+      target: { kind: 'session', value: { sessionId: sid('session-one'), displayTitle: 'session-one' } },
+      label: '会话“session-one”的操作', className: rowCss.iconButton,
+    })
+    if (mode === 'workspace') {
+      expect(renderFactorySlot).toHaveBeenCalledWith('contextMenu.button', {
+        target: { kind: 'workspace', value: { workspaceId: wid('alpha'), path: '/projects/alpha', displayTitle: 'alpha' } },
+        label: '工作区“alpha”的操作', className: rowCss.iconButton,
+      })
+    }
+  })
+
+  it('binds the list area as the section scroller only while the sidebar is wide', () => {
+    const bindScrollerRef = vi.fn()
+    const browser = mount({ useSectionScroller: () => ({ bindScrollerRef }) })
+    const list = browser.view.container.querySelector<HTMLElement>('[data-sidebar-list-area]')!
+    expect(bindScrollerRef).toHaveBeenLastCalledWith(list)
+    rerender(browser, { wide: false })
+    expect(bindScrollerRef).toHaveBeenLastCalledWith(null)
+    expect(browser.view.container.querySelector('[data-sidebar-list-area]')).toBe(list)
+    rerender(browser, { wide: true })
+    expect(bindScrollerRef).toHaveBeenLastCalledWith(list)
+    browser.view.unmount()
+    expect(bindScrollerRef).toHaveBeenLastCalledWith(null)
+  })
+
   it.each(['workspace', 'flat', 'ungrouped'] as const)('keeps %s recency independent of arrival order and saved manual positions', (mode) => {
     localStorage.clear()
     const preferences = createWorkspaceViewStore().create()
@@ -754,7 +806,7 @@ describe('WorkspaceBrowser', () => {
     expect(requestSessionRename).toHaveBeenCalledTimes(2)
   })
 
-  it('renders both Session row lists for every visible row in the grouped tree and the flat list', () => {
+  it('renders row actions inline while Session menus belong to the global overlay', () => {
     const rendered = vi.fn()
     const renderSlot: WorkspaceBrowserProps['renderSlot'] = (name: string, owner: object) => {
       rendered(name, owner)
@@ -768,11 +820,11 @@ describe('WorkspaceBrowser', () => {
     expect(rendered).not.toHaveBeenCalledWith('sidebar.workspaces.session.menu.item', expect.anything())
     fireEvent.click(screen.getByText('alpha'))
     const owner = { sessionId: sid('alpha-s'), displayTitle: 'alpha-s' }
-    expect(rendered).toHaveBeenCalledWith('sidebar.workspaces.session.menu.item', owner)
+    expect(rendered).not.toHaveBeenCalledWith('sidebar.workspaces.session.menu.item', owner)
     expect(rendered).toHaveBeenCalledWith('sidebar.workspaces.session.row.action', owner)
     rendered.mockClear()
     act(() => { b.store.actions.setGroupBy('flat') })
-    expect(rendered).toHaveBeenCalledWith('sidebar.workspaces.session.menu.item', owner)
+    expect(rendered).not.toHaveBeenCalledWith('sidebar.workspaces.session.menu.item', owner)
     expect(rendered).toHaveBeenCalledWith('sidebar.workspaces.session.row.action', owner)
   })
 
@@ -808,7 +860,7 @@ describe('WorkspaceBrowser', () => {
     })
     const status = (id: string, value: Partial<SessionStatus>) =>
       hook<SessionStatusSnapshot>(new Map([[sid(id), {
-        running: false, pendingInteraction: undefined, completionUnread: false, ...value,
+        running: false, pendingInteraction: undefined, completionUnread: false, completionFailed: false, ...value,
       }]]))
     const expectVisible = (count: number) => {
       expect(screen.getAllByRole('treeitem').map(row => within(row).getByText(/^(alpha|session-\d+)$/u).textContent))
@@ -829,7 +881,7 @@ describe('WorkspaceBrowser', () => {
       pendingInteraction: { key: 'question:1', kind: 'plan-review', sessionId: sid('session-7') } as SessionPendingInteraction,
     }) })
     expectVisible(7)
-    rerender(b, { useSessionStatus: status('session-8', { completionUnread: true }) })
+    rerender(b, { useSessionStatus: status('session-8', { completionUnread: true, completionFailed: false }) })
     expectVisible(8)
     fireEvent.click(screen.getByRole('button', { name: '展开其余 4 个会话' }))
     expectVisible(12)
@@ -845,7 +897,7 @@ describe('WorkspaceBrowser', () => {
     })
     fireEvent.click(screen.getByText('alpha'))
     const running = (value: boolean) => hook<SessionStatusSnapshot>(new Map([[sid('session-9'), {
-      running: value, pendingInteraction: undefined, completionUnread: false,
+      running: value, pendingInteraction: undefined, completionUnread: false, completionFailed: false,
     }]]))
     rerender(b, { useSessionStatus: running(true) })
     rerender(b, { useSessionStatus: running(false) })
@@ -868,15 +920,15 @@ describe('WorkspaceBrowser', () => {
     })
     fireEvent.click(screen.getByText('alpha'))
     const running = (...ids: string[]) => hook<SessionStatusSnapshot>(new Map(ids.map(id => [sid(id), {
-      running: true, pendingInteraction: undefined, completionUnread: false,
+      running: true, pendingInteraction: undefined, completionUnread: false, completionFailed: false,
     }])))
     rerender(b, {
       useSessions: hook(sessionState(items, { main: sid('session-53') })),
       useSessionStatus: hook<SessionStatusSnapshot>(new Map([
-        [sid('session-55'), { running: true, pendingInteraction: undefined, completionUnread: false }],
-        [sid('session-56'), { running: false, pendingInteraction: undefined, completionUnread: true }],
+        [sid('session-55'), { running: true, pendingInteraction: undefined, completionUnread: false, completionFailed: false }],
+        [sid('session-56'), { running: false, pendingInteraction: undefined, completionUnread: true, completionFailed: false }],
         [sid('session-57'), {
-          running: false, completionUnread: false,
+          running: false, completionUnread: false, completionFailed: false,
           pendingInteraction: { key: 'question:1', kind: 'question', sessionId: sid('session-57') } as SessionPendingInteraction,
         }],
       ])),
@@ -1318,18 +1370,15 @@ describe('WorkspaceBrowser', () => {
     expect(startSession).toHaveBeenCalledWith(wid('alpha'))
   })
 
-  it('auto-expands the Ungrouped bucket for a loose current session; its header has no menu and its ＋ is inert', () => {
-    const startSession = vi.fn()
+  it('auto-expands the Ungrouped bucket for a loose current session; its header has neither menu nor ＋', () => {
     mount({
       useSessions: hook(sessionState([summary('loose', 1)], { main: sid('loose') })),
       useWorkspaces: hook(workspaceState([workspace('alpha', [])])),
-      startSession,
     })
     // The loose session's group is UNGROUPED_KEY: expanded by the effect.
     expect(screen.getByText('loose')).toBeTruthy()
     expect(screen.queryByRole('button', { name: '工作区“未分组”的操作' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: '在“未分组”中新建会话' }))
-    expect(startSession).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: '在“未分组”中新建会话' })).toBeNull()
   })
 
   it('keeps an already-expanded group when the selection moves within it', () => {
@@ -1951,6 +2000,21 @@ describe('WorkspaceBrowser', () => {
     expect(screen.getByRole('button', { name: '搜索会话' }).getAttribute('aria-expanded')).toBe('true')
   })
 
+  it('expands an inert drawer with retained wide content before focusing search', () => {
+    vi.useFakeTimers()
+    try {
+      const expandSidebar = vi.fn(() => { b.view.container.removeAttribute('inert') })
+      const b = mount({ wide: true, expandSidebar })
+      b.view.container.setAttribute('inert', '')
+      act(() => { b.controls.search() })
+      expect(expandSidebar).toHaveBeenCalledOnce()
+      act(() => { vi.advanceTimersByTime(300) })
+      expect(document.activeElement).toBe(screen.getByPlaceholderText('搜索会话名称'))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('rail state renders icon controls that request expansion', () => {
     vi.useFakeTimers()
     try {
@@ -2395,7 +2459,7 @@ describe('WorkspaceBrowser', () => {
 
   it('labels an unrenamed default Workspace in the reader’s language and every other title verbatim', () => {
     const renameWorkspace = vi.fn(async () => {})
-    mount({
+    const browser = mount({
       useWorkspaces: hook(workspaceState([
         workspace('alpha', [], 'default-workspace'),
         workspace('beta', [], 'default-workspace backup'),
@@ -2407,8 +2471,7 @@ describe('WorkspaceBrowser', () => {
     // The dialog edits the text on screen, and the stored title — not that
     // text — decides whether confirming saves. So confirming the untouched
     // prefill pins the localized name and the row stops following the language.
-    fireEvent.click(screen.getByRole('button', { name: '工作区“默认工作区”的操作' }))
-    fireEvent.click(screen.getByRole('menuitem', { name: '重命名' }))
+    browser.openDialog(wid('alpha'), '默认工作区', 'rename')
     expect(screen.getByLabelText<HTMLInputElement>('工作区名称').value).toBe('默认工作区')
     expect(screen.queryByRole('alert')).toBeNull()
     const confirm = screen.getByRole<HTMLButtonElement>('button', { name: '重命名' })
@@ -2420,12 +2483,11 @@ describe('WorkspaceBrowser', () => {
   it('renames a workspace through the row menu dialog', async () => {
     let resolveRename!: () => void
     const renameWorkspace = vi.fn(() => new Promise<void>((resolve) => { resolveRename = resolve }))
-    mount({
+    const browser = mount({
       useWorkspaces: hook(workspaceState([workspace('alpha', [], 'Alpha'), workspace('beta', [], 'Beta')])),
       renameWorkspace,
     })
-    fireEvent.click(screen.getByRole('button', { name: '工作区“Alpha”的操作' }))
-    fireEvent.click(screen.getByRole('menuitem', { name: '重命名' }))
+    browser.openDialog(wid('alpha'), 'Alpha', 'rename')
     const input = screen.getByLabelText<HTMLInputElement>('工作区名称')
     expect(input.value).toBe('Alpha')
     // Unchanged and blank names stay blocked.
@@ -2449,18 +2511,21 @@ describe('WorkspaceBrowser', () => {
 
   it('rename via Enter, failure surfaces the error, Cancel closes', async () => {
     const renameWorkspace = vi.fn(async () => { throw new Error('rename conflict') })
-    mount({
+    const browser = mount({
       useWorkspaces: hook(workspaceState([workspace('alpha', [], 'Alpha')])),
       renameWorkspace,
     })
-    fireEvent.click(screen.getByRole('button', { name: '工作区“Alpha”的操作' }))
-    fireEvent.click(screen.getByRole('menuitem', { name: '重命名' }))
+    browser.openDialog(wid('alpha'), 'Alpha', 'rename')
     const input = screen.getByLabelText<HTMLInputElement>('工作区名称')
     // Enter with a blocked draft (unchanged) does nothing.
     fireEvent.keyDown(input, { key: 'Enter' })
     expect(renameWorkspace).not.toHaveBeenCalled()
     fireEvent.change(input, { target: { value: 'Renamed' } })
     fireEvent.keyDown(input, { key: 'a' })
+    fireEvent.compositionStart(input)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(renameWorkspace).not.toHaveBeenCalled()
+    fireEvent.compositionEnd(input)
     fireEvent.keyDown(input, { key: 'Enter' })
     expect(renameWorkspace).toHaveBeenCalledWith(wid('alpha'), 'Renamed')
     await waitFor(() => { expect(screen.getByRole('alert').textContent).toBe('rename conflict') })
@@ -2473,12 +2538,11 @@ describe('WorkspaceBrowser', () => {
 
   it('reports non-Error rename failures as text', async () => {
     const renameWorkspace = vi.fn(async () => { throw 'denied' })
-    mount({
+    const browser = mount({
       useWorkspaces: hook(workspaceState([workspace('alpha', [], 'Alpha')])),
       renameWorkspace,
     })
-    fireEvent.click(screen.getByRole('button', { name: '工作区“Alpha”的操作' }))
-    fireEvent.click(screen.getByRole('menuitem', { name: '重命名' }))
+    browser.openDialog(wid('alpha'), 'Alpha', 'rename')
     fireEvent.change(screen.getByLabelText('工作区名称'), { target: { value: 'Other' } })
     fireEvent.click(screen.getByRole('button', { name: '重命名' }))
     await waitFor(() => { expect(screen.getByRole('alert').textContent).toBe('denied') })
@@ -2491,8 +2555,7 @@ describe('WorkspaceBrowser', () => {
       useWorkspaces: hook(workspaceState([workspace('alpha', ['session'], 'Alpha')])),
       deleteWorkspace,
     })
-    fireEvent.click(screen.getByRole('button', { name: '工作区“Alpha”的操作' }))
-    fireEvent.click(screen.getByRole('menuitem', { name: '删除工作区' }))
+    browser.openDialog(wid('alpha'), 'Alpha', 'delete')
     const dialog = screen.getByRole('dialog', { name: '删除工作区' })
     expect(dialog.textContent).toContain('将把“Alpha”从工作区列表中移除')
     expect(dialog.textContent).toContain('文件夹与会话记录会保留')
@@ -2522,12 +2585,11 @@ describe('WorkspaceBrowser', () => {
     const deleteWorkspace = vi.fn()
       .mockRejectedValueOnce(new Error('storage unavailable'))
       .mockRejectedValueOnce('denied')
-    mount({
+    const browser = mount({
       useWorkspaces: hook(workspaceState([workspace('alpha', [], 'Alpha')])),
       deleteWorkspace,
     })
-    fireEvent.click(screen.getByRole('button', { name: '工作区“Alpha”的操作' }))
-    fireEvent.click(screen.getByRole('menuitem', { name: '删除工作区' }))
+    browser.openDialog(wid('alpha'), 'Alpha', 'delete')
     fireEvent.click(screen.getByRole('button', { name: '删除工作区' }))
     await waitFor(() => { expect(screen.getByRole('alert').textContent).toBe('storage unavailable') })
     expect(screen.getByRole('dialog', { name: '删除工作区' })).toBeTruthy()
@@ -2539,13 +2601,12 @@ describe('WorkspaceBrowser', () => {
 
   it('Cancel, Escape, and Close dismiss deletion without calling the action', () => {
     const deleteWorkspace = vi.fn(async () => {})
-    mount({
+    const browser = mount({
       useWorkspaces: hook(workspaceState([workspace('alpha', [], 'Alpha')])),
       deleteWorkspace,
     })
     const open = () => {
-      fireEvent.click(screen.getByRole('button', { name: '工作区“Alpha”的操作' }))
-      fireEvent.click(screen.getByRole('menuitem', { name: '删除工作区' }))
+      browser.openDialog(wid('alpha'), 'Alpha', 'delete')
     }
     open()
     fireEvent.click(screen.getByRole('button', { name: '取消' }))
@@ -2634,7 +2695,7 @@ describe('Workspace tree grouping', () => {
     fireEvent.click(screen.getByText('Child'))
     fireEvent.click(screen.getByText('Projects'))
     const status = (running: boolean) => hook<SessionStatusSnapshot>(new Map([[sid('child-8'), {
-      running, pendingInteraction: undefined, completionUnread: false,
+      running, pendingInteraction: undefined, completionUnread: false, completionFailed: false,
     }]]))
     rerender(b, { useSessionStatus: status(true) })
     rerender(b, { useSessionStatus: status(false) })
